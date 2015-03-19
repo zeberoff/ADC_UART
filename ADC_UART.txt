@@ -1,0 +1,152 @@
+//This program implements a 10-bit ADC that computes average ADC data collected from a desired array size and then transmits the average over the UART.
+
+#include "msp430g2553.h"
+#include <stdio.h>
+
+#define TXD BIT2
+#define LED2 BIT6
+
+volatile unsigned int latest_adc_result;
+volatile unsigned int average;
+volatile unsigned int timer_count = 0;
+int sum = 0;
+int ADC_Flag = 0;
+int data_array[];
+int count = 0;
+int t = 0;
+char buffer[32];
+
+// Function Prototypes
+
+void init_led();
+void init_uart();
+void init_timer();
+void init_adc();
+
+
+void main(void)
+{
+  // Initialize Clocks
+	WDTCTL 	 = WDTPW + WDTHOLD;  // stop WDT
+	BCSCTL1  = CALBC1_1MHZ;  // calibration of basic clock system
+	DCOCTL 	 = CALDCO_1MHZ;  // calibration of digitally controlled oscillator
+	
+  // Call Function Prototypes
+	init_led();
+	init_uart();
+	init_timer();
+	init_adc();
+
+	// enable interrupts and put the CPU to sleep
+	_bis_SR_register(GIE+LPM0_bits);
+}
+
+
+void init_led()
+{
+	P1DIR = LED2; // Enable the output of this register
+}
+
+//UART Initialization of registers
+void init_uart()
+{
+	P1SEL  = TXD;  // Select this register as Transmission
+	P1SEL2 = TXD;
+	UCA0CTL1 |= UCSSEL_2;  // Use Master Clock at 1MHz
+	UCA0BR0 = 104;  // 9600 baud rate: 1^6/9600 = 104.2
+	UCA0BR1 = 0;
+	UCA0MCTL = UCBRS0;  // modulation UCBRSx = 1
+	UCA0CTL1 &= ~UCSWRST;  //initialize USCI state machine **
+	IE2 |= UCA0TXIE;  // Enable USCI_A0 TX interrupt
+}
+
+//Timer Initialization of registers
+void init_timer()
+{
+	TA0CTL |= TACLR;  // reset timer
+	TA0CTL  = TASSEL_2 + ID_0 + MC_2;  // SMCLK. Input divider = 1. Continuous mode, interrupt disabled.
+	TA0CCTL0 = OUTMOD_2 + CCIE + CCIFG;  // Compare mode. Interrupt enabled
+}
+
+//ADC Initialization of registers
+void init_adc()
+{
+	ADC10AE0 |= BIT5;
+	ADC10CTL1 = INCH_5		// temperature sensor input to ADC
+			+ SHS_0		// use ADC10SC bit to trigger sampling
+			+ ADC10DIV_4	// Clock used for analog to digital conversion: ADC10DIV_3 -> ADC10CLK/4. For reference ADC10DIV_4 -> ADC10CLK/5
+			+ ADC10SSEL_3	// clock source = SMCLK
+			+ CONSEQ_0;	// single channel, single conversion, although multiple channels at once can be converted.
+	ADC10DTC1 = 1;			// one block per transfer
+
+	ADC10CTL0 = SREF_1		// SREF_1 = 1.5 V; SREF_0 = Vcc
+			+ ADC10SHT_3	// 64. Sample and Hold Time.  This adjust how many clock cycles the sampling period will be. Average is taken from 64 cycles.
+			+ REFON		// reference generator on
+			+ ADC10ON;	// turn on ADC10
+
+}
+
+//** ADC Timer Interrupt. Timer A is in continuous mode and once it overflows at 2^16 or 65536 counts, an interrupt is generated. This is interrupt occurs every Tc = 65536/1MHz = 65.5 ms. This interrupt period can be optimized with the time required to perform an average of size n **
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer0_A0(void)
+{
+	unsigned int n = 16; //Size of data_array used to compute average ADC
+	unsigned int timer_limit = 1; // This sets the limit as to how often ADC data is collected.
+	static int update = 0;
+
+	timer_count++;
+	if (timer_count == timer_limit) 
+	{
+		timer_count = 0;
+
+		if ((ADC10CTL1 & ADC10BUSY) == 0) // If ADC10BUSY is true the following code does not execute.
+		{
+			ADC10CTL0 |= ENC + ADC10SC;
+			latest_adc_result=ADC10MEM;
+			ADC_Flag = 1;
+			data_array[update++] = latest_adc_result;
+
+		}
+
+		 if (ADC_Flag == 1 && update == n)
+		{
+			ADC_Flag = 0;
+			update = 0;
+			sum = 0;
+
+			for (t = 0; t < n; t++) // This loop computes the average from the ADC data elements stored in the data_aray[].
+			{
+				sum += data_array[t];
+
+				if (t == n-1)
+				{
+				average = sum>>4;
+				IE2 |= UCA0TXIE; //Once the average ADC is computed (approximately every n*Tc*timer_limit), the TX interrupt is enabled and data is passed to the UART.
+				}
+			}
+		}
+	}
+}
+
+#pragma vector = USCIAB0TX_VECTOR  
+__interrupt void USCI0TX_ISR(void)
+{
+	P1OUT |= LED2; // Indicator for data transmission
+	_delay_cycles(1000);
+	P1OUT &= ~LED2;
+
+				unsigned int i = 0;
+
+				sprintf(buffer, " %d \n\r", average);
+
+					while (buffer[i] != '\0')
+					{
+						while (!(IFG2 & UCA0TXIFG));	// USCI_A0 TX buffer ready?
+						UCA0TXBUF = buffer[i++];
+					}
+
+				IE2 &= ~UCA0TXIFG;
+
+
+
+}
